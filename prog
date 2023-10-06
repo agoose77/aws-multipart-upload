@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+import asyncio
+
+import aiobotocore.session
+import argparse
+import json
+import pathlib
+import os
+import itertools
+import tempfile
+import hashlib
+
+
+# Upload each part
+def byte_ranges(size, chunk_size):
+    n_chunks, remainder = divmod(size, chunk_size)
+    for i in range(n_chunks):
+        yield (i * chunk_size, (i + 1) * chunk_size)
+    if remainder:
+        yield n_chunks * chunk_size, n_chunks * chunk_size + remainder
+
+
+def batched(iterable, n):
+    # batched('ABCDEFG', 3) --> ABC DEF G
+    if n < 1:
+        raise ValueError('n must be at least one')
+    it = iter(iterable)
+    while True:
+        batch = tuple(itertools.islice(it, n))
+        if not batch:
+            break
+        yield batch
+
+
+def reduce_binary_tree(sequence, reducer):
+    if len(sequence) == 1:
+        return sequence[0]
+    elif len(sequence) == 2:
+        return reducer(sequence[0], sequence[1])
+    else:
+        pairs = [reduce_binary_tree(b, reducer) for b in batched(sequence, 2)]
+        return reduce_binary_tree(pairs, reducer)
+
+
+def concatenating_hash(left, right):
+    return hashlib.sha256(left + right).digest()
+
+
+async def upload_file_part(client, file_path, start, stop, vault_name, account_id, upload_id):
+    with open(file_path, "rb") as f, tempfile.NamedTemporaryFile() as tmpfile:
+        # Copy contents
+        f.seek(start)
+        buffer = f.read(stop - start)
+        tmpfile.write(buffer)
+
+        # Upload multipart
+        response = await client.upload_multipart_part(
+            vaultName=vault_name,
+            accountId=account_id,
+            uploadId=upload_id,
+            range=f'bytes {start}-{stop - 1}/*',
+            body=buffer
+        )
+
+        # Ensure things agree
+        sha256 = hashlib.sha256(buffer)
+        assert sha256.hexdigest() == response['checksum']
+
+        # Compute hash
+        return sha256.digest()
+
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file", type=pathlib.Path)
+    parser.add_argument("account_id", metavar="account-id")
+    parser.add_argument("vault_name", metavar="vault-name")
+    parser.add_argument("-p", "--part-size", type=int, default=1024 * 1024)
+    args = parser.parse_args()
+
+    session = aiobotocore.session.get_session()
+    async with session.create_client('glacier') as client:
+        init_response = await client.initiate_multipart_upload(
+            vaultName=args.vault_name,
+            accountId=args.account_id,
+            partSize=str(args.part_size),
+        )
+        upload_id = init_response['uploadId']
+
+        # Split into parts
+        size = args.file.stat().st_size
+
+        tasks = [
+            asyncio.create_task(upload_file_part(client, args.file, start, stop, vault_name=args.vault_name,
+                                                 account_id=args.account_id, upload_id=upload_id)) for start, stop in
+            byte_ranges(size, args.part_size)
+        ]
+        for i, coro in enumerate(asyncio.as_completed(tasks)):
+            await coro
+            print(f"\rTask {i+1} of {len(tasks)} complete")
+
+        hashes = await asyncio.gather(*tasks)
+
+        # Compute binary tree hash
+        tree_hash_digest = reduce_binary_tree(
+            hashes, concatenating_hash
+        )
+        tree_hash = tree_hash_digest.hex()
+        print(f"Tree hash {tree_hash}")
+
+        # Validate submission
+        response = await client.complete_multipart_upload(
+            vaultName=args.vault_name,
+            accountId=args.account_id,
+            uploadId=upload_id,
+            archiveSize=str(size),
+            checksum=tree_hash
+        )
+        print(response)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
