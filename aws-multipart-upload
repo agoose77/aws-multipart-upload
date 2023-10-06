@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
-import hashlib
-import itertools
 import math
 import pathlib
 import tempfile
@@ -32,32 +30,6 @@ def byte_ranges(size, chunk_size):
         yield n_chunks * chunk_size, n_chunks * chunk_size + remainder
 
 
-def batched(iterable, n):
-    # batched('ABCDEFG', 3) --> ABC DEF G
-    if n < 1:
-        raise ValueError("n must be at least one")
-    it = iter(iterable)
-    while True:
-        batch = tuple(itertools.islice(it, n))
-        if not batch:
-            break
-        yield batch
-
-
-def reduce_binary_tree(sequence, reducer):
-    if len(sequence) == 1:
-        return sequence[0]
-    elif len(sequence) == 2:
-        return reducer(sequence[0], sequence[1])
-    else:
-        pairs = [reduce_binary_tree(b, reducer) for b in batched(sequence, 2)]
-        return reduce_binary_tree(pairs, reducer)
-
-
-def concatenating_hash(left, right):
-    return hashlib.sha256(left + right).digest()
-
-
 def _copy_chunk(source, dest, start, stop):
     # Copy contents
     source.seek(start)
@@ -71,7 +43,6 @@ async def upload_file_part(
 ):
     with open(file_path, "rb") as f, tempfile.NamedTemporaryFile() as tmpfile:
         buffer = await asyncio.to_thread(_copy_chunk, f, tmpfile, start, stop)
-
         # Upload multipart
         response = await client.upload_part(
             Bucket=bucket,
@@ -79,6 +50,10 @@ async def upload_file_part(
             UploadId=upload_id,
             Body=buffer,
             PartNumber=part_number,
+            # TODO, this fails?
+            # ChecksumMD5=base64.b64encode(hashlib.md5(buffer).digest()).decode(
+            #     "ascii"
+            # )
         )
 
         # Compute hash
@@ -112,43 +87,54 @@ async def main():
             StorageClass=args.storage_class,
         )
         upload_id = init_response["UploadId"]
+        try:
+            # Split into parts
+            size = args.file.stat().st_size
 
-        # Split into parts
-        size = args.file.stat().st_size
+            n_parts = math.ceil(size / args.part_size)
+            assert n_parts < 10_000
 
-        n_parts = math.ceil(size / args.part_size)
-        assert n_parts < 10_000
-
-        tasks = [
-            asyncio.create_task(
-                upload_file_part(
-                    client,
-                    args.file,
-                    start,
-                    stop,
-                    part_number=i,
-                    bucket=args.bucket,
-                    upload_id=upload_id,
+            tasks = [
+                asyncio.create_task(
+                    upload_file_part(
+                        client,
+                        args.file,
+                        start,
+                        stop,
+                        part_number=i,
+                        bucket=args.bucket,
+                        upload_id=upload_id,
+                    )
                 )
+                for i, (start, stop) in enumerate(
+                    byte_ranges(size, args.part_size), start=1
+                )
+            ]
+
+            # Report progress
+            for i, coro in enumerate(asyncio.as_completed(tasks)):
+                await coro
+                print(f"\rTask {i + 1} of {len(tasks)} complete")
+
+            # Gather responses
+            parts = await asyncio.gather(*tasks)
+
+        except asyncio.CancelledError:
+            await client.abort_multipart_upload(
+                Bucket=args.bucket, Key=args.file.name, UploadId=upload_id
             )
-            for i, (start, stop) in enumerate(byte_ranges(size, args.part_size), start=1)
-        ]
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            await coro
-            print(f"\rTask {i + 1} of {len(tasks)} complete")
-
-        parts = await asyncio.gather(*tasks)
-
-        # Validate submission
-        response = await client.complete_multipart_upload(
-            Bucket=args.bucket,
-            Key=args.file.name,
-            MultipartUpload={
-                "Parts": parts,
-            },
-            UploadId=upload_id,
-        )
-        print(response)
+            raise
+        else:
+            # Validate submission
+            response = await client.complete_multipart_upload(
+                Bucket=args.bucket,
+                Key=args.file.name,
+                MultipartUpload={
+                    "Parts": parts,
+                },
+                UploadId=upload_id,
+            )
+            print(response)
 
 
 if __name__ == "__main__":
