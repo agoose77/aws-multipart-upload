@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import hashlib
+import itertools
+import math
+import pathlib
+import tempfile
+
+import aiobotocore.session
+
+STORAGE_CLASSES = (
+    "STANDARD",
+    "REDUCED_REDUNDANCY",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER",
+    "DEEP_ARCHIVE",
+    "OUTPOSTS",
+    "GLACIER_IR",
+    "SNOW",
+)
+
+
+# Upload each part
+def byte_ranges(size, chunk_size):
+    n_chunks, remainder = divmod(size, chunk_size)
+    for i in range(n_chunks):
+        yield (i * chunk_size, (i + 1) * chunk_size)
+    if remainder:
+        yield n_chunks * chunk_size, n_chunks * chunk_size + remainder
+
+
+def batched(iterable, n):
+    # batched('ABCDEFG', 3) --> ABC DEF G
+    if n < 1:
+        raise ValueError("n must be at least one")
+    it = iter(iterable)
+    while True:
+        batch = tuple(itertools.islice(it, n))
+        if not batch:
+            break
+        yield batch
+
+
+def reduce_binary_tree(sequence, reducer):
+    if len(sequence) == 1:
+        return sequence[0]
+    elif len(sequence) == 2:
+        return reducer(sequence[0], sequence[1])
+    else:
+        pairs = [reduce_binary_tree(b, reducer) for b in batched(sequence, 2)]
+        return reduce_binary_tree(pairs, reducer)
+
+
+def concatenating_hash(left, right):
+    return hashlib.sha256(left + right).digest()
+
+
+def _copy_chunk(source, dest, start, stop):
+    # Copy contents
+    source.seek(start)
+    buffer = source.read(stop - start)
+    dest.write(buffer)
+    return buffer
+
+
+async def upload_file_part(
+    client, file_path, start, stop, part_number, bucket, upload_id
+):
+    with open(file_path, "rb") as f, tempfile.NamedTemporaryFile() as tmpfile:
+        buffer = await asyncio.to_thread(_copy_chunk, f, tmpfile, start, stop)
+
+        # Upload multipart
+        response = await client.upload_part(
+            Bucket=bucket,
+            Key=file_path.name,
+            UploadId=upload_id,
+            Body=buffer,
+            PartNumber=part_number,
+        )
+
+        # Compute hash
+        part_keys = {
+            "ETag",
+            "ChecksumCRC32",
+            "ChecksumCRC32C",
+            "ChecksumSHA1",
+            "ChecksumSHA256",
+        }
+        part = {k: v for k, v in response.items() if k in part_keys}
+        part["PartNumber"] = part_number
+        return part
+
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file", type=pathlib.Path)
+    parser.add_argument("bucket")
+    parser.add_argument("-p", "--part-size", type=int, default=5 * 1024 * 1024)
+    parser.add_argument(
+        "-c", "--storage-class", type=str, choices=STORAGE_CLASSES, default="STANDARD"
+    )
+    args = parser.parse_args()
+
+    session = aiobotocore.session.get_session()
+    async with session.create_client("s3") as client:
+        init_response = await client.create_multipart_upload(
+            Bucket=args.bucket,
+            Key=args.file.name,
+            StorageClass=args.storage_class,
+        )
+        upload_id = init_response["UploadId"]
+
+        # Split into parts
+        size = args.file.stat().st_size
+
+        n_parts = math.ceil(size / args.part_size)
+        assert n_parts < 10_000
+
+        tasks = [
+            asyncio.create_task(
+                upload_file_part(
+                    client,
+                    args.file,
+                    start,
+                    stop,
+                    part_number=i,
+                    bucket=args.bucket,
+                    upload_id=upload_id,
+                )
+            )
+            for i, (start, stop) in enumerate(byte_ranges(size, args.part_size), start=1)
+        ]
+        for i, coro in enumerate(asyncio.as_completed(tasks)):
+            await coro
+            print(f"\rTask {i + 1} of {len(tasks)} complete")
+
+        parts = await asyncio.gather(*tasks)
+
+        # Validate submission
+        response = await client.complete_multipart_upload(
+            Bucket=args.bucket,
+            Key=args.file.name,
+            MultipartUpload={
+                "Parts": parts,
+            },
+            UploadId=upload_id,
+        )
+        print(response)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
